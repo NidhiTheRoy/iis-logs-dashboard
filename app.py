@@ -1,7 +1,10 @@
-"""IIS Web Logs — stakeholder dashboard.
+"""Website Visitor Analytics — bots vs real people, and what the people did.
 
-Reads Gold aggregates from Neon Postgres and presents them in plain language:
-percentages, context, and readable labels instead of raw counts and field names.
+Answers the brief directly:
+  - How many REAL PEOPLE visited (not requests)
+  - Which traffic is automated, and which bots
+  - What those people actually looked at (real pages, not APIs)
+  - How they behaved (pages per visit, duration, bounce, entry pages)
 
 Deploy on Streamlit Community Cloud with a secret named NEON_DSN.
 """
@@ -11,14 +14,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 from sqlalchemy import create_engine, text
 
-st.set_page_config(page_title="Web Traffic Analytics", layout="wide")
+st.set_page_config(page_title="Visitor Analytics", layout="wide")
 
-BLUE = "#2E75B6"
-GREEN = "#548235"
-AMBER = "#C88A00"
-RED = "#C0392B"
-GREY = "#8A8A8A"
-
+BLUE, GREY, GREEN, AMBER = "#2E75B6", "#9AA0A6", "#548235", "#C88A00"
 engine = create_engine(st.secrets["NEON_DSN"])
 
 
@@ -28,138 +26,163 @@ def q(sql):
         return pd.read_sql(text(sql), c)
 
 
-traffic = q("SELECT * FROM gold_traffic_hourly")
-status = q("SELECT sc_status, SUM(cnt) AS total FROM gold_status_daily GROUP BY sc_status")
-pages = q("SELECT cs_uri_stem, SUM(views) AS views FROM gold_top_pages GROUP BY cs_uri_stem")
-funnel = q("SELECT funnel_market, SUM(events) AS events, SUM(unique_visitors) AS visitors "
-           "FROM gold_funnel GROUP BY funnel_market")
+daily = q("SELECT * FROM gold_daily_summary ORDER BY event_date")
+bots = q("SELECT bot_name, SUM(requests) AS requests FROM gold_bot_breakdown "
+         "GROUP BY bot_name ORDER BY requests DESC")
+pages = q("SELECT cs_uri_stem, page_category, SUM(views) AS views, SUM(visits) AS visits "
+          "FROM gold_top_pages GROUP BY cs_uri_stem, page_category "
+          "ORDER BY views DESC LIMIT 20")
+cats = q("SELECT page_category, SUM(views) AS views, SUM(visits) AS visits "
+         "FROM gold_page_categories GROUP BY page_category ORDER BY views DESC")
+sess = q("SELECT pages_viewed, duration_sec, is_bounce, entry_page FROM gold_sessions")
+funnel = q("SELECT funnel_market, SUM(visitors) AS visitors, SUM(events) AS events "
+           "FROM gold_funnel GROUP BY funnel_market ORDER BY visitors DESC LIMIT 10")
 
-total_requests = int(traffic["requests"].sum())
-bot_requests = int(traffic["bot_requests"].sum())
-bot_pct = (bot_requests / total_requests * 100) if total_requests else 0
-human_requests = total_requests - bot_requests
-avg_latency_s = traffic["avg_time_ms"].mean() / 1000 if len(traffic) else 0
+# ---------------------------------------------------------------- headline nums
+visitors = int(daily["visitors"].sum())
+visits = int(daily["visits"].sum())
+page_views = int(daily["page_views"].sum())
+human_req = int(daily["human_requests"].sum())
+bot_req = int(daily["bot_requests"].sum())
+total_req = int(daily["total_requests"].sum())
+bot_pct = bot_req / total_req * 100 if total_req else 0
 
-total_status = int(status["total"].sum()) if len(status) else 0
+st.title("Website Visitor Analytics")
+st.caption("Real people vs automated traffic, and what the real people did. "
+           "Counts below are **people and visits**, not raw server requests.")
 
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Real visitors", f"{visitors:,}",
+          help="Distinct people (browsers), excluding bots. Not request counts.")
+c2.metric("Visits", f"{visits:,}",
+          help="Distinct sessions. One person can visit more than once.")
+c3.metric("Pages viewed", f"{page_views:,}",
+          help="Actual content pages loaded by humans — excludes images, APIs and tracking calls.")
+c4.metric("Automated traffic", f"{bot_pct:.0f}%",
+          delta=f"{bot_req:,} of {total_req:,} requests", delta_color="off")
 
-def status_band(df, lo, hi):
-    m = (df["sc_status"] >= lo) & (df["sc_status"] < hi)
-    return int(df.loc[m, "total"].sum())
-
-
-success = status_band(status, 200, 300)
-redirect = status_band(status, 300, 400)
-client_err = status_band(status, 400, 500)
-server_err = status_band(status, 500, 600)
-success_pct = (success / total_status * 100) if total_status else 0
-error_pct = ((client_err + server_err) / total_status * 100) if total_status else 0
-n_days = traffic["event_date"].nunique() if "event_date" in traffic else 0
-
-st.title("Web Traffic Analytics")
-st.caption(f"newhomesource.com web server logs \u00b7 {n_days} days of data \u00b7 "
-           f"{total_requests:,} total requests")
-
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Total requests", f"{total_requests/1e6:.2f}M")
-k2.metric("Real visitors", f"{human_requests/1e6:.2f}M",
-          help="Requests from humans, excluding bots and crawlers")
-k3.metric("Bot traffic", f"{bot_pct:.0f}%",
-          delta=f"{bot_requests:,} requests", delta_color="off",
-          help="Share of all traffic from crawlers, monitors and scrapers")
-latency_flag = "\u2705" if avg_latency_s < 1 else "\u26a0\ufe0f"
-k4.metric("Avg response time", f"{avg_latency_s:.2f}s {latency_flag}",
-          help="Under 1s is good; higher suggests slow endpoints")
+st.info(f"**Why these numbers are smaller than raw request counts:** the servers logged "
+        f"{total_req:,} requests, but one page view triggers many requests (images, scripts, "
+        f"API and tracking calls). Only **{page_views:,}** were real pages a person looked at, "
+        f"from **{visitors:,}** distinct people.")
 
 st.divider()
 
-left, right = st.columns([1, 1.3])
+# ---------------------------------------------------------------- bots vs human
+left, right = st.columns([1, 1.2])
 with left:
-    st.subheader("Who is visiting?")
-    donut = go.Figure(go.Pie(
-        labels=["Real visitors", "Bots & crawlers"],
-        values=[human_requests, bot_requests],
-        hole=0.6, marker_colors=[BLUE, GREY],
-        textinfo="percent", sort=False))
-    donut.update_layout(showlegend=True, height=300, margin=dict(t=10, b=10, l=10, r=10),
-                        legend=dict(orientation="h", y=-0.1))
-    st.plotly_chart(donut, use_container_width=True)
-    st.caption(f"**{bot_pct:.0f}% of traffic is automated.** Nearly "
-               f"{'a third' if bot_pct>28 else 'a quarter'} of requests are not real "
-               "people \u2014 worth accounting for in any traffic or conversion analysis.")
+    st.subheader("Bots vs real people")
+    fig = go.Figure(go.Pie(labels=["Real people", "Automated"],
+                           values=[human_req, bot_req], hole=.6,
+                           marker_colors=[BLUE, GREY], sort=False, textinfo="percent"))
+    fig.update_layout(height=290, margin=dict(t=6, b=6, l=6, r=6),
+                      legend=dict(orientation="h", y=-.08))
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(f"**{bot_pct:.0f}% of all server traffic is automated.** Any analysis based on "
+               "raw traffic without removing this is materially wrong.")
 
 with right:
-    st.subheader("Is the site healthy?")
-    h1, h2, h3 = st.columns(3)
-    h1.metric("Successful", f"{success_pct:.1f}%")
-    h2.metric("Redirects", f"{redirect/total_status*100:.1f}%" if total_status else "\u2014")
-    h3.metric("Errors", f"{error_pct:.1f}%",
-              delta="healthy" if error_pct < 2 else "elevated",
-              delta_color="normal" if error_pct < 2 else "inverse")
-    health = pd.DataFrame({
-        "Outcome": ["Success (2xx)", "Redirect (3xx)", "Client error (4xx)", "Server error (5xx)"],
-        "Requests": [success, redirect, client_err, server_err],
-    })
-    bar = px.bar(health, x="Requests", y="Outcome", orientation="h",
-                 color="Outcome",
-                 color_discrete_sequence=[GREEN, BLUE, AMBER, RED])
-    bar.update_layout(showlegend=False, height=230, margin=dict(t=10, b=10, l=10, r=10),
-                      yaxis_title="", xaxis_title="")
-    st.plotly_chart(bar, use_container_width=True)
-    st.caption(f"**{success_pct:.0f}% of requests succeed.** Errors are "
-               f"{'within a normal range' if error_pct < 2 else 'higher than ideal and worth a look'}.")
+    st.subheader("Which bots, and what they cost us")
+    if len(bots):
+        bfig = px.bar(bots.head(10), x="requests", y="bot_name", orientation="h",
+                      color_discrete_sequence=[GREY],
+                      labels={"requests": "Requests", "bot_name": ""})
+        bfig.update_layout(height=290, margin=dict(t=6, b=6, l=6, r=6),
+                           yaxis=dict(autorange="reversed"))
+        st.plotly_chart(bfig, use_container_width=True)
+        st.caption("Search engines and SEO crawlers are expected. Large volumes from "
+                   "unidentified sources are worth investigating — they consume capacity "
+                   "and distort analytics.")
 
 st.divider()
 
-st.subheader("Traffic by day")
-daily = (traffic.groupby("event_date")["requests"].sum().reset_index()
-         .sort_values("event_date"))
-daily["event_date"] = pd.to_datetime(daily["event_date"]).dt.strftime("%b %d")
-dbar = px.bar(daily, x="event_date", y="requests", color_discrete_sequence=[BLUE])
-dbar.update_layout(height=320, margin=dict(t=10, b=10, l=10, r=10),
-                   xaxis_title="", yaxis_title="Requests")
-st.plotly_chart(dbar, use_container_width=True)
-st.caption("Each bar is one full day of logs. Only days present in the data are shown \u2014 "
-           "gaps between files are intentionally not connected.")
+# ---------------------------------------------------------------- what they did
+st.subheader("What did real people actually do?")
+s1, s2, s3, s4 = st.columns(4)
+if len(sess):
+    s1.metric("Pages per visit", f"{sess['pages_viewed'].mean():.1f}")
+    med_dur = sess.loc[sess["duration_sec"] > 0, "duration_sec"].median()
+    s2.metric("Typical visit length", f"{(med_dur or 0)/60:.1f} min")
+    s3.metric("Bounced (1 page only)", f"{sess['is_bounce'].mean()*100:.0f}%",
+              help="Visits where the person viewed a single page and left")
+    engaged = (sess["pages_viewed"] >= 3).mean() * 100
+    s4.metric("Engaged visits (3+ pages)", f"{engaged:.0f}%")
+
+st.caption("These describe **behaviour per visit** — the clickstream view of how people "
+           "move through the site, not how many files the server sent.")
 
 st.divider()
 
-st.subheader("What content gets the most views?")
-NOISE = ("/signalr", "/googleanalytics", "/getadparameters", "/ajax",
-         "/setutmparameters", "/gettypeaheadoptions", "/segment", "/eventlogger")
+# ---------------------------------------------------------------- content
+cl, cr = st.columns([1, 1.2])
+with cl:
+    st.subheader("What kind of content?")
+    if len(cats):
+        cfig = px.bar(cats, x="views", y="page_category", orientation="h",
+                      color_discrete_sequence=[BLUE],
+                      labels={"views": "Page views", "page_category": ""})
+        cfig.update_layout(height=330, margin=dict(t=6, b=6, l=6, r=6),
+                           yaxis=dict(autorange="reversed"))
+        st.plotly_chart(cfig, use_container_width=True)
+        st.caption("The mix of content people look at — home plans, communities, "
+                   "search pages — showing what visitors come for.")
 
+with cr:
+    st.subheader("Most-viewed pages (real pages only)")
+    t = pages.head(12).rename(columns={
+        "cs_uri_stem": "Page", "page_category": "Type",
+        "views": "Views", "visits": "Visits"})
+    t["Views"] = t["Views"].map(lambda v: f"{int(v):,}")
+    t["Visits"] = t["Visits"].map(lambda v: f"{int(v):,}")
+    st.dataframe(t.reset_index(drop=True), use_container_width=True, hide_index=True)
+    st.caption("Images, scripts, API calls and tracking beacons are excluded — these are "
+               "pages a person genuinely opened.")
 
-def is_page(path):
-    p = str(path).lower()
-    return not any(p.startswith(n) for n in NOISE)
+st.divider()
 
-
-real_pages = pages[pages["cs_uri_stem"].apply(is_page)].copy()
-show_all = st.toggle("Include tracking & API endpoints", value=False,
-                     help="On: shows every request path including backend calls. "
-                          "Off: shows only real content pages.")
-table = (pages if show_all else real_pages).sort_values("views", ascending=False).head(10)
-table = table.rename(columns={"cs_uri_stem": "Page", "views": "Views"})
-table["Views"] = table["Views"].map(lambda v: f"{int(v):,}")
-st.dataframe(table.reset_index(drop=True), use_container_width=True, hide_index=True)
-st.caption("Backend and tracking calls are hidden by default so this reflects actual "
-           "pages visitors look at. Toggle above to see all endpoints.")
+# ---------------------------------------------------------------- markets
+st.subheader("Which markets attract the most people?")
+if len(funnel):
+    funnel["label"] = "Market " + funnel["funnel_market"].astype(str)
+    ffig = px.bar(funnel, x="visitors", y="label", orientation="h",
+                  color_discrete_sequence=[GREEN],
+                  labels={"visitors": "Distinct visitors", "label": ""})
+    ffig.update_layout(height=350, margin=dict(t=6, b=6, l=6, r=6),
+                       yaxis=dict(autorange="reversed"))
+    st.plotly_chart(ffig, use_container_width=True)
+    st.caption("Ranked by **distinct people**, not event counts — so one very active user "
+               "cannot make a market look more popular than it is.")
 
 st.divider()
 
-st.subheader("Which markets drive the most engagement?")
-top_markets = funnel.sort_values("events", ascending=False).head(10).copy()
-top_markets["label"] = "Market " + top_markets["funnel_market"].astype(str)
-mbar = px.bar(top_markets, x="events", y="label", orientation="h",
-              color_discrete_sequence=[BLUE],
-              labels={"events": "Engagement events", "label": ""})
-mbar.update_layout(height=380, margin=dict(t=10, b=10, l=10, r=10),
-                   yaxis=dict(autorange="reversed"))
-st.plotly_chart(mbar, use_container_width=True)
-st.caption("Top 10 markets by engagement events (from the site's own activity beacons). "
-           "Market IDs shown as-is \u2014 mapping them to market names would make this even "
-           "clearer if a lookup is available.")
+# ---------------------------------------------------------------- trend
+st.subheader("Visitors by day")
+d = daily.copy()
+d["day"] = pd.to_datetime(d["event_date"]).dt.strftime("%b %d")
+dfig = px.bar(d, x="day", y="visitors", color_discrete_sequence=[BLUE],
+              labels={"visitors": "Real visitors", "day": ""})
+dfig.update_layout(height=300, margin=dict(t=6, b=6, l=6, r=6))
+st.plotly_chart(dfig, use_container_width=True)
+st.caption("Only days present in the data are shown. Bars, not a line — we don't invent "
+           "traffic across gaps between log files.")
 
 st.divider()
-st.caption("Data refreshes automatically as new log files are processed. "
-           "Built on Databricks (processing) \u2192 Neon (serving) \u2192 Streamlit (this view).")
+with st.expander("How these numbers are calculated"):
+    st.markdown("""
+**Real visitor** — a distinct browser identified by the Google Analytics client id in the
+cookie, after removing automated traffic. Not a request count.
+
+**Visit (session)** — a distinct `ASP.NET_SessionId`. One person may have several visits.
+
+**Page view** — a request classified as real page content. Static assets (images, CSS, JS,
+fonts), backend API calls (`/ajax/`, `/signalr/`, `/googleanalytics/`) and tracking beacons
+(`/eventlogger/`) are excluded, because none of them is a person looking at a page.
+
+**Bot** — flagged when the user agent declares a crawler, when one IP makes an unusually
+high number of requests in a day, or when a request has no cookie, no referer and is not a
+page. The reason for each flag is stored so any classification can be audited.
+
+*Limitation:* visitors are counted from cookies, so a person blocking cookies or using
+several devices may be counted more than once or not at all. Session-based counts are the
+more reliable measure.
+""")
