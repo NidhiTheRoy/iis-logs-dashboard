@@ -114,7 +114,7 @@ st.info(f"Servers logged **{total_req:,}** requests, but one page view fires man
 st.divider()
 
 # ------------------------------------------------------------------ bots
-st.subheader("Bots vs real people")
+st.subheader("Bots vs real people — share of server requests")
 a, b = st.columns([1, 1.4])
 with a:
     f = go.Figure(go.Pie(labels=["Real people", "Automated"],
